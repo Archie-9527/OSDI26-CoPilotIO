@@ -2,6 +2,8 @@
 #define __COPILOT_H__
 
 #include <cstdint>
+#include <atomic>
+#include <stdexcept>
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
@@ -93,7 +95,9 @@ public:
         ptrdiff_t off = (ptrdiff_t)(aligned_addr - info.va);
         cpu_ptr = (copilot_notify_entry*)((char*)map_ptr + off);
 
+        cudaDeviceSynchronize();
         memset((void*)cpu_ptr, 0, COPILOT_NOTIFY_BYTES);
+        copilot_sfence();
     }
 
     void destroy() {
@@ -213,7 +217,7 @@ struct copilot_thread_args {
     copilot_cq_info* cqs;
     int n_cqs;
     int core_id;
-    volatile bool* stop;
+    std::atomic<bool>* stop;
 };
 
 static void* copilot_poll_thread(void* arg) {
@@ -224,16 +228,14 @@ static void* copilot_poll_thread(void* arg) {
     CPU_SET(a->core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-    struct sched_param param;
-    param.sched_priority = 99;
-    sched_setscheduler(0, SCHED_FIFO, &param);
+    // Ordinary scheduling avoids starving SwarmIO dispatchers on shared CPUs.
 
     int n_cqs = a->n_cqs;
     copilot_cq_info* cqs = a->cqs;
     uint64_t total_completions = 0;
     uint64_t next_log = 500000;
 
-    while (!*a->stop) {
+    while (!a->stop->load(std::memory_order_acquire)) {
         bool any_progress = false;
 
         for (int q = 0; q < n_cqs; q++) {
@@ -254,7 +256,13 @@ static void* copilot_poll_thread(void* arg) {
             e.loc = ci.head;
             e.cq_head = ci.head;
             e.ready = 1;
-            ci.cpu_ptr[cid] = e;
+            // Publish metadata before the ready flag on the WC BAR mapping.
+            volatile copilot_notify_entry* dst = &ci.cpu_ptr[cid];
+            dst->pos = e.pos;
+            dst->loc = e.loc;
+            dst->cq_head = e.cq_head;
+            copilot_sfence();
+            dst->ready = 1;
             copilot_sfence();
 
             if (ci.cq_table_cpu_ptr) {
@@ -307,11 +315,13 @@ class CoPilotAgent {
     pthread_t threads[MAX_THREADS];
     copilot_thread_args thread_args[MAX_THREADS];
     copilot_cq_info cq_infos[MAX_QPS];
-    volatile bool stop_flag;
+    std::atomic<bool> stop_flag;
     int n_threads;
 
 public:
     CoPilotAgent() : stop_flag(false), n_threads(0) {}
+
+    ~CoPilotAgent() { if (n_threads) stop(); }
 
     template<typename QP>
     void start(int n_qps, QP** h_qps, CoPilotNotify* notifies, int base_core, int n_cores = 0,
@@ -319,8 +329,16 @@ public:
         if (n_cores <= 0) n_cores = n_qps;
         if (n_cores > n_qps) n_cores = n_qps;
 
-        stop_flag = false;
-        n_threads = n_cores;
+        if (n_threads || n_qps <= 0 || n_qps > MAX_QPS || n_cores > MAX_THREADS ||
+            base_core < 0 || base_core + n_cores > CPU_SETSIZE)
+            throw std::runtime_error("invalid CoPilotAgent geometry");
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed))
+            throw std::runtime_error("cannot inspect CPU affinity");
+        for (int t=0; t<n_cores; ++t)
+            if (!CPU_ISSET(base_core+t, &allowed))
+                throw std::runtime_error("CoPilot polling core unavailable");
+        stop_flag.store(false, std::memory_order_release);
 
         for (int i = 0; i < n_qps; i++) {
             cq_infos[i].cq               = (volatile nvm_cpl_t*)h_qps[i]->cq.vaddr_host;
@@ -341,17 +359,26 @@ public:
             thread_args[t].core_id = base_core + t;
             thread_args[t].stop   = &stop_flag;
 
-            pthread_create(&threads[t], nullptr, copilot_poll_thread, &thread_args[t]);
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            cpu_set_t mask;
+            CPU_ZERO(&mask); CPU_SET(base_core+t, &mask);
+            int rc = pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask);
+            if (!rc) rc = pthread_create(&threads[t], &attr, copilot_poll_thread, &thread_args[t]);
+            pthread_attr_destroy(&attr);
+            if (rc) { stop(); throw std::runtime_error("CoPilot polling thread creation failed"); }
+            ++n_threads;
         }
-        printf("CoPilotAgent: %d QPs on %d cores (%d-%d), %d QPs/core, SCHED_FIFO 99\n",
+        printf("CoPilotAgent: %d QPs on %d cores (%d-%d), %d QPs/core, SCHED_OTHER\n",
                n_qps, n_cores, base_core, base_core + n_cores - 1,
                n_qps / n_cores);
     }
 
     void stop() {
-        stop_flag = true;
+        stop_flag.store(true, std::memory_order_release);
         for (int i = 0; i < n_threads; i++)
             pthread_join(threads[i], nullptr);
+        n_threads = 0;
         printf("CoPilotAgent: stopped\n");
     }
 };

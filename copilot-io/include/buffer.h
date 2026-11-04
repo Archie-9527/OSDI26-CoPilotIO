@@ -224,7 +224,7 @@ inline DmaPtr createDma(const nvm_ctrl_t* ctrl, size_t size, int cudaDevice)
 
 // Allocate hugepage-backed memory (2MB pages, physically contiguous).
 // GPU can access via zero-copy (PCIe). Avoids CQR contiguity issues.
-inline DmaPtr createDmaHugepage(const nvm_ctrl_t* ctrl, size_t size)
+inline DmaPtr createDmaHugepage(const nvm_ctrl_t* ctrl, size_t size, void** host_out = nullptr)
 {
     nvm_dma_t* dma = nullptr;
     const size_t HUGE_PAGE_SIZE = 2UL * 1024 * 1024;
@@ -259,6 +259,7 @@ inline DmaPtr createDmaHugepage(const nvm_ctrl_t* ctrl, size_t size)
         throw error(string("Failed to get device pointer for hugepage: ") + cudaGetErrorString(cerr));
     }
 
+    if (host_out) *host_out = hostPtr;
     dma->vaddr = devPtr;
 
     return DmaPtr(dma, [hostPtr, alloc_size](nvm_dma_t* dma) {
@@ -270,7 +271,7 @@ inline DmaPtr createDmaHugepage(const nvm_ctrl_t* ctrl, size_t size)
 
 // Allocate CPU pinned memory with DMA host mapping (4KB pages).
 // GPU can access via zero-copy (PCIe). vaddr is set to GPU-visible pointer.
-inline DmaPtr createDmaPinned(const nvm_ctrl_t* ctrl, size_t size)
+inline DmaPtr createDmaPinned(const nvm_ctrl_t* ctrl, size_t size, void** host_out = nullptr)
 {
     nvm_dma_t* dma = nullptr;
     void* hostPtr = nullptr;
@@ -298,6 +299,7 @@ inline DmaPtr createDmaPinned(const nvm_ctrl_t* ctrl, size_t size)
         throw error(string("Failed to get device pointer for pinned memory: ") + cudaGetErrorString(cerr));
     }
 
+    if (host_out) *host_out = hostPtr;
     dma->vaddr = devPtr;
 
     return DmaPtr(dma, [hostPtr](nvm_dma_t* dma) {

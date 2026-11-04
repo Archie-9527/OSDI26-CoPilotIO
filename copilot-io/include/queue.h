@@ -131,6 +131,7 @@ struct QueuePair
             if (sq_size > cq_size) sq_size = cq_size;
         }
 
+        void* cq_host = nullptr;
         size_t sq_data_size = sq_size * sizeof(nvm_cmd_t);
         size_t cq_data_size = cq_size * sizeof(nvm_cpl_t);
 
@@ -144,9 +145,9 @@ struct QueuePair
         if (cq_placement == QUEUE_GPU) {
             this->cq_mem = createDma(ctrl, NVM_PAGE_ALIGN(cq_data_size, 1UL << 16), cudaDevice);
         } else if (use_hugepage_cq) {
-            this->cq_mem = createDmaHugepage(ctrl, cq_data_size);
+            this->cq_mem = createDmaHugepage(ctrl, cq_data_size, &cq_host);
         } else {
-            this->cq_mem = createDmaPinned(ctrl, NVM_PAGE_ALIGN(cq_data_size, page_sz));
+            this->cq_mem = createDmaPinned(ctrl, NVM_PAGE_ALIGN(cq_data_size, page_sz), &cq_host);
         }
 
         this->pageSize = info.page_size;
@@ -164,7 +165,7 @@ struct QueuePair
         // std::cout << "after nvm_admin_cq_create\n";
 
         // Save host-side pointers before GPU override (for CPU polling in CoPilotIO)
-        this->cq.vaddr_host = this->cq.vaddr;
+        this->cq.vaddr_host = cq_host ? cq_host : this->cq.vaddr;
 
         // Get a valid device pointer for CQ doorbell
         void* devicePtr = nullptr;

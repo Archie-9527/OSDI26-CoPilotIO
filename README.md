@@ -1,3 +1,6 @@
+> SwarmIO 分支适配：请使用父目录 [README](../README.md) 的统一入口构建和运行。
+> 下文保留上游物理 SSD 实验说明，不能直接作为 SwarmIO 测试步骤；本分支统一基准是 `microbenchmark/swarmio_read.cu`。
+
 # CoPilotIO: CPU as a Co-pilot for GPU I/O to Free GPU Compute
 
 **Guanyi Chen, Qi Chen, Shu Yin, Jian Zhang**

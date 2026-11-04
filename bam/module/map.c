@@ -34,7 +34,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     unsigned long i;
     struct map* map = NULL;
 
-    map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
+    map = kvmalloc(sizeof(struct map) + (n_pages) * sizeof(uint64_t), GFP_KERNEL);
     if (map == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -148,6 +148,7 @@ static long map_user_pages(struct map* map)
 #warning "Building for older kernel, not properly tested"
     retval = get_user_pages(map->vaddr, map->n_addrs, 1, 0, pages, NULL);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+    /* Linux 6.5 起 get_user_pages 移除了最后的 vmas 参数。 */
     retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages, NULL);
 #else
     retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages);
@@ -214,7 +215,7 @@ struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr,
 
     list_insert(list, &md->list);
 
-    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }
@@ -323,7 +324,7 @@ int map_gpu_memory(struct map* map, struct list* list)
     }
 
     gd->mappings = (nvidia_p2p_dma_mapping_t**)  kmalloc(sizeof(nvidia_p2p_dma_mapping_t*) * max_num_ctrls, GFP_KERNEL);
-    
+
     if (gd->mappings == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -347,25 +348,6 @@ int map_gpu_memory(struct map* map, struct list* list)
         printk(KERN_ERR "nvidia_p2p_get_pages() failed: %d\n", err);
         return err;
     }
-
-    /* Debug: print raw physical_address from nvidia_p2p_page_table_t */
-#if 0
-    {
-        int dbg_max = (gd->pages->entries < 4) ? gd->pages->entries : 4;
-        int d;
-        printk(KERN_INFO "BAM P2P: entries=%u page_size=%u\n",
-               gd->pages->entries, gd->pages->page_size);
-        for (d = 0; d < dbg_max; d++) {
-            printk(KERN_INFO "BAM P2P: physical_address[%d] = 0x%llx\n",
-                   d, (unsigned long long)gd->pages->pages[d]->physical_address);
-        }
-        if (gd->pages->entries > 4) {
-            printk(KERN_INFO "BAM P2P: physical_address[%u] = 0x%llx (last)\n",
-                   gd->pages->entries - 1,
-                   (unsigned long long)gd->pages->pages[gd->pages->entries - 1]->physical_address);
-        }
-    }
-#endif
 
     element = list_next(&list->head);
 
@@ -406,22 +388,10 @@ int map_gpu_memory(struct map* map, struct list* list)
 
     map->n_addrs = gd->pages->entries;
 
-    /* Debug: side-by-side comparison of p2p physical vs DMA addresses */
-#if 0
-    {
-        int cmp_max = (map->n_addrs < 4) ? map->n_addrs : 4;
-        int c;
-        printk(KERN_INFO "BAM P2P: === physical_address vs dma_address comparison ===\n");
-        for (c = 0; c < cmp_max; c++) {
-            printk(KERN_INFO "BAM P2P: [%d] p2p_phys=0x%llx  dma=0x%llx  diff=0x%llx\n",
-                   c,
-                   (unsigned long long)gd->pages->pages[c]->physical_address,
-                   (unsigned long long)map->addrs[c],
-                   (unsigned long long)(map->addrs[c] - gd->pages->pages[c]->physical_address));
-        }
-    }
-#endif
-    
+    //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
+//    for (j = 0; j < map->n_addrs; j++)
+//        printk("\tpaddr: %llx\n", (uint64_t) map->addrs[j]);
+
     return 0;
 }
 #endif
@@ -456,7 +426,7 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
 
     list_insert(list, &md->list);
 
-    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }

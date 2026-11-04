@@ -17,6 +17,7 @@ struct Config {
     uint64_t num_blks=2097152, queue_depth=512, num_queues=1;
     int gpu=0, base_core=0, cores=4;
     bool random=false;
+    bool host_notify=false;
 };
 static uint64_t number(const std::string& s) {
     size_t n=0;
@@ -32,6 +33,10 @@ static Config parse(int argc,char** argv) {
         if(eq==std::string::npos) throw std::runtime_error("expected --name=value");
         auto k=a.substr(0,eq), s=a.substr(eq+1);
         if(k=="--random") { if(s!="true" && s!="false") throw std::runtime_error("invalid boolean"); c.random=s=="true"; continue; }
+        if(k=="--notify_memory") {
+            if(s!="host" && s!="gdr") throw std::runtime_error("invalid notification memory");
+            c.host_notify=s=="host"; continue;
+        }
         auto v=number(s);
         if(k=="--threads") c.threads=v;
         else if(k=="--blk_size") c.blk_size=v;
@@ -80,7 +85,7 @@ __global__ void read_kernel(Controller** ctrls,page_cache_d_t* pc,
 #ifdef SWARMIO_COPILOT
         volatile copilot_notify_entry* notify=notifies[tid%ctrls[0]->n_qps];
         while(!notify[cid].ready) __nanosleep(64);
-        // CPU publishes metadata before ready. Bypass L1 for WC BAR writes.
+        // CPU publishes metadata before ready; volatile reads bypass GPU L1.
         __threadfence_system();
         pos=notify[cid].pos; head=notify[cid].loc; head_=notify[cid].cq_head;
         __threadfence_system();
@@ -117,11 +122,12 @@ int main(int argc,char** argv) try {
 #ifdef SWARMIO_COPILOT
     std::vector<CoPilotNotify> notifies(c.num_queues);
     std::vector<copilot_notify_entry*> ptrs(c.num_queues);
-    for(unsigned q=0;q<c.num_queues;q++) { notifies[q].init(); ptrs[q]=notifies[q].gpu_ptr; }
+    for(unsigned q=0;q<c.num_queues;q++) { notifies[q].init(c.host_notify); ptrs[q]=notifies[q].gpu_ptr; }
     copilot_notify_entry** d_ptrs=nullptr;
     cuda_err_chk(cudaMalloc(&d_ptrs,ptrs.size()*sizeof(ptrs[0])));
     cuda_err_chk(cudaMemcpy(d_ptrs,ptrs.data(),ptrs.size()*sizeof(ptrs[0]),cudaMemcpyHostToDevice));
     CoPilotAgent agent;
+    printf("Notification memory: %s\n", c.host_notify ? "host" : "gdr");
     agent.start(c.num_queues,ctrl.h_qps,notifies.data(),c.base_core,c.cores);
 #endif
     cudaEvent_t begin,end;

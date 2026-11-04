@@ -89,7 +89,7 @@ struct QueuePair
 
 
 
-    inline QueuePair( const nvm_ctrl_t* ctrl, const uint32_t cudaDevice, const struct nvm_ns_info ns, const struct nvm_ctrl_info info, nvm_aq_ref& aq_ref, const uint16_t qp_id, const uint64_t queueDepth, QueuePlacement sq_placement = QUEUE_GPU, QueuePlacement cq_placement = QUEUE_GPU)
+    inline QueuePair( const nvm_ctrl_t* ctrl, const uint32_t cudaDevice, const struct nvm_ns_info ns, const struct nvm_ctrl_info info, nvm_aq_ref& aq_ref, const uint16_t qp_id, const uint64_t queueDepth, QueuePlacement sq_placement = QUEUE_GPU, QueuePlacement cq_placement = QUEUE_GPU, volatile uint32_t* relay_dbs = nullptr)
     {
         //this->this = (QueuePairThis*) malloc(sizeof(QueuePairThis));
 
@@ -169,7 +169,9 @@ struct QueuePair
 
         // Get a valid device pointer for CQ doorbell
         void* devicePtr = nullptr;
-        cudaError_t err = cudaHostGetDevicePointer(&devicePtr, (void*) this->cq.db, 0);
+        cudaError_t err = cudaSuccess;
+        if (relay_dbs) devicePtr = (void*)(relay_dbs + qp_id * 2 + 1);
+        else err = cudaHostGetDevicePointer(&devicePtr, (void*) this->cq.db, 0);
         if (err != cudaSuccess)
         {
             throw error(string("Failed to get device pointer") + cudaGetErrorString(err));
@@ -186,7 +188,8 @@ struct QueuePair
 
 
         // Get a valid device pointer for SQ doorbell
-        err = cudaHostGetDevicePointer(&devicePtr, (void*) this->sq.db, 0);
+        if (relay_dbs) devicePtr = (void*)(relay_dbs + qp_id * 2);
+        else err = cudaHostGetDevicePointer(&devicePtr, (void*) this->sq.db, 0);
         if (err != cudaSuccess)
         {
             throw error(string("Failed to get device pointer") + cudaGetErrorString(err));

@@ -32,6 +32,7 @@
 #include <cuda/std/atomic>
 
 #include "queue.h"
+#include "doorbell_mapping.h"
 
 
 #define MAX_QUEUES 1024
@@ -40,6 +41,7 @@
 struct Controller
 {
     cuda::atomic<uint64_t, cuda::thread_scope_device> access_counter;
+    DoorbellMapping        doorbells;
     nvm_ctrl_t*             ctrl;
     nvm_aq_ref              aq_ref;
     DmaPtr                  aq_mem;
@@ -66,7 +68,7 @@ struct Controller
 #endif
 
     Controller(const char* path, uint32_t nvmNamespace, uint32_t cudaDevice, uint64_t queueDepth, uint64_t numQueues,
-               QueuePlacement sq_placement = QUEUE_GPU, QueuePlacement cq_placement = QUEUE_GPU);
+               QueuePlacement sq_placement = QUEUE_GPU, QueuePlacement cq_placement = QUEUE_GPU, bool relay_doorbells = false);
 
     void reserveQueues();
 
@@ -148,7 +150,7 @@ Controller::Controller(uint64_t ctrl_id, uint32_t ns_id, uint32_t)
 
 
 inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDevice, uint64_t queueDepth, uint64_t numQueues,
-                              QueuePlacement sq_placement, QueuePlacement cq_placement)
+                              QueuePlacement sq_placement, QueuePlacement cq_placement, bool relay_doorbells)
     : ctrl(nullptr)
     , aq_ref(nullptr)
     , deviceId(cudaDevice)
@@ -166,15 +168,12 @@ inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDev
         throw error(string("Failed to get controller reference: ") + nvm_strerror(status));
     }
 
-    // Create admin queue memory
+    // Validate/register BAR or allocate relay memory before resetting the controller.
+    try { doorbells.init(ctrl, numQueues, relay_doorbells); }
+    catch (...) { nvm_ctrl_free(ctrl); ctrl = nullptr; close(fd); throw; }
+    // Create admin queue memory.
     aq_mem = createDma(ctrl, ctrl->page_size * 3);
-
     initializeController(*this, ns_id);
-    cudaError_t err = cudaHostRegister((void*) ctrl->mm_ptr, NVM_CTRL_MEM_MINSIZE, cudaHostRegisterIoMemory);
-    if (err != cudaSuccess)
-    {
-        throw error(string("Unexpected error while mapping IO memory (cudaHostRegister): ") + cudaGetErrorString(err));
-    }
     queue_counter = 0;
     page_size = ctrl->page_size;
     blk_size = this->ns.lba_data_size;
@@ -187,10 +186,11 @@ inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDev
     cuda_err_chk(cudaMalloc((void**)&d_qps, sizeof(QueuePair)*n_qps));
     for (size_t i = 0; i < n_qps; i++) {
         //printf("started creating qp\n");
-        h_qps[i] = new QueuePair(ctrl, cudaDevice, ns, info, aq_ref, i+1, queueDepth, sq_placement, cq_placement);
+        h_qps[i] = new QueuePair(ctrl, cudaDevice, ns, info, aq_ref, i+1, queueDepth, sq_placement, cq_placement, doorbells.device_doorbells());
         //printf("finished creating qp\n");
         cuda_err_chk(cudaMemcpy(d_qps+i, h_qps[i], sizeof(QueuePair), cudaMemcpyHostToDevice));
     }
+    doorbells.start();
     //printf("finished creating all qps\n");
 
 
@@ -205,6 +205,7 @@ inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDev
 
 inline Controller::~Controller()
 {
+    doorbells.destroy();
     cudaFree(d_qps);
     for (size_t i = 0; i < n_qps; i++) {
         delete h_qps[i];

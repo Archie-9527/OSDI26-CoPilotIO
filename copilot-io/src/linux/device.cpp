@@ -144,12 +144,13 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int filedes)
 
     const size_t mm_size = NVM_CTRL_MEM_MINSIZE;
     void* mm_ptr = mmap(NULL, mm_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FILE|MAP_LOCKED, dev->fd, 0);
-    if (mm_ptr == NULL)
+    if (mm_ptr == MAP_FAILED)
     {
+        err = errno;
         close(dev->fd);
         free(dev);
-        dprintf("Failed to map device memory: %s\n", strerror(errno));
-        return errno;
+        dprintf("Failed to map device memory: %s\n", strerror(err));
+        return err;
     }
 
     err = _nvm_ctrl_init(ctrl, dev, &ops, DEVICE_TYPE_IOCTL, mm_ptr, mm_size);

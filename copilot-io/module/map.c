@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/slab.h>
+#include <linux/overflow.h>
 #include <linux/mm_types.h>
 #include <linux/mm.h>
 #include <linux/dma-mapping.h>
@@ -34,7 +35,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     unsigned long i;
     struct map* map = NULL;
 
-    map = kvmalloc(sizeof(struct map) + (n_pages) * sizeof(uint64_t), GFP_KERNEL);
+    map = kvmalloc(struct_size(map, addrs, n_pages), GFP_KERNEL);
     if (map == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -50,6 +51,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     map->data = NULL;
     map->release = NULL;
     map->n_addrs = n_pages;
+    map->n_dma_addrs = 0;
 
 
     for (i = 0; i < map->n_addrs; ++i)
@@ -108,7 +110,7 @@ static void release_user_pages(struct map* map)
     struct device* dev;
 
     dev = &map->pdev->dev;
-    for (i = 0; i < map->n_addrs; ++i)
+    for (i = 0; i < map->n_dma_addrs; ++i)
     {
         dma_unmap_page(dev, map->addrs[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
     }
@@ -155,16 +157,19 @@ static long map_user_pages(struct map* map)
 #endif
     if (retval <= 0)
     {
-        kfree(pages);
+        kvfree(pages);
         printk(KERN_ERR "get_user_pages() failed: %ld\n", retval);
-        return retval;
+        return retval < 0 ? retval : -EFAULT;
     }
 
     if (map->n_addrs != retval)
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %ld\n", map->n_addrs, retval);
+        printk(KERN_WARNING "Requested %lu host pages, but only got %ld\n", map->n_addrs, retval);
+        for (i = 0; i < retval; ++i)
+            put_page(pages[i]);
+        kvfree(pages);
+        return -ENOMEM;
     }
-    map->n_addrs = retval;
     map->page_size = PAGE_SIZE;
     map->data = (void*) pages;
     map->release = release_user_pages;
@@ -177,9 +182,10 @@ static long map_user_pages(struct map* map)
         retval = dma_mapping_error(dev, map->addrs[i]);
         if (retval != 0)
         {
-            printk(KERN_ERR "Failed to map page for some reason\n");
-            return retval;
+            printk(KERN_ERR "Failed to DMA-map host page\n");
+            return -EIO;
         }
+        ++map->n_dma_addrs;
        // printk("map_user_page: device: %02x:%02x.%1x\tvaddr: %llx\ti: %lu\tdma_addr: %llx\n", map->pdev->bus->number, PCI_SLOT(map->pdev->devfn), PCI_FUNC(map->pdev->devfn), (uint64_t) map->vaddr, i, map->addrs[i]);
     }
 
@@ -349,6 +355,11 @@ int map_gpu_memory(struct map* map, struct list* list)
         return err;
     }
 
+    if (!gd->pages || gd->pages->entries != map->n_addrs)
+    {
+        printk(KERN_ERR "GPU page table size does not match requested mapping\n");
+        return -ERANGE;
+    }
     element = list_next(&list->head);
 
 

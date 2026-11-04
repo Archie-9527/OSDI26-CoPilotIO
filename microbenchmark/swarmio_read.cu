@@ -18,6 +18,8 @@ struct Config {
     int gpu=0, base_core=0, cores=4;
     bool random=false;
     bool host_notify=false;
+    bool relay_doorbells=false;
+    bool probe_only=false;
 };
 static uint64_t number(const std::string& s) {
     size_t n=0;
@@ -32,10 +34,18 @@ static Config parse(int argc,char** argv) {
         std::string a=argv[i]; auto eq=a.find('=');
         if(eq==std::string::npos) throw std::runtime_error("expected --name=value");
         auto k=a.substr(0,eq), s=a.substr(eq+1);
+        if(k=="--probe_only") {
+            if(s!="true" && s!="false") throw std::runtime_error("invalid probe boolean");
+            c.probe_only=s=="true"; continue;
+        }
         if(k=="--random") { if(s!="true" && s!="false") throw std::runtime_error("invalid boolean"); c.random=s=="true"; continue; }
         if(k=="--notify_memory") {
             if(s!="host" && s!="gdr") throw std::runtime_error("invalid notification memory");
             c.host_notify=s=="host"; continue;
+        }
+        if(k=="--doorbell_mode") {
+            if(s!="mmio" && s!="relay") throw std::runtime_error("invalid doorbell mode");
+            c.relay_doorbells=s=="relay"; continue;
         }
         auto v=number(s);
         if(k=="--threads") c.threads=v;
@@ -60,6 +70,38 @@ static Config parse(int argc,char** argv) {
        c.queue_depth<2 || c.queue_depth>1024 || (c.queue_depth&(c.queue_depth-1)))
         throw std::runtime_error("invalid workload geometry (pages must cover threads)");
     return c;
+}
+
+// No admin reset, queue creation, or NVMe read/write commands in this check.
+static int probe_mapping(const Config& c) {
+    int fd=open("/dev/libnvm0",O_RDWR);
+    if(fd<0) throw error("probe: failed to open /dev/libnvm0");
+    nvm_ctrl_t* raw=nullptr;
+    int status=nvm_ctrl_init(&raw,fd);
+    close(fd);
+    if(!nvm_ok(status)) throw error(std::string("probe: controller mmap: ")+nvm_strerror(status));
+    std::unique_ptr<nvm_ctrl_t,decltype(&nvm_ctrl_free)> ctrl(raw,&nvm_ctrl_free);
+    printf("Probe stage: doorbell %s\n", c.relay_doorbells ? "relay" : "mmio"); fflush(stdout);
+    DoorbellMapping doorbells;
+    doorbells.init(ctrl.get(),c.num_queues,c.relay_doorbells);
+    if(!c.relay_doorbells) {
+        void* alias=nullptr;
+        auto err=cudaHostGetDevicePointer(&alias,(void*)ctrl->mm_ptr,0);
+        if(err!=cudaSuccess) throw error(std::string("probe: BAR CUDA alias: ")+cudaGetErrorString(err));
+    }
+    printf("Probe stage: host DMA mapping\n"); fflush(stdout);
+    auto host=createDma(ctrl.get(),65536);
+    printf("Probe stage: GPU P2P DMA mapping\n"); fflush(stdout);
+    auto gpu=createDma(ctrl.get(),65536,c.gpu);
+    if(!host->n_ioaddrs || !gpu->n_ioaddrs) throw error("probe: empty DMA mapping");
+#ifdef SWARMIO_COPILOT
+    printf("Probe stage: notification %s\n",c.host_notify ? "host" : "gdr"); fflush(stdout);
+    CoPilotNotify notify;
+    notify.init(c.host_notify);
+#endif
+    cuda_err_chk(cudaDeviceSynchronize());
+    printf("Probe OK: registration and DMA mappings only; no NVMe I/O issued\n");
+    return 0;
 }
 
 __global__ void read_kernel(Controller** ctrls,page_cache_d_t* pc,
@@ -97,7 +139,6 @@ __global__ void read_kernel(Controller** ctrls,page_cache_d_t* pc,
         if ((static_cast<volatile nvm_cpl_t*>(qp->cq.vaddr)[pos].dword[3] >> 17) != 0) {
             printf("NVMe read error cid=%u\n",unsigned(cid)); asm("trap;");
         }
-        qp->cq.tail.fetch_add(1,cuda::std::memory_order_acq_rel);
         cq_dequeue(&qp->cq,pos,&qp->sq,head,head_);
         put_cid(&qp->sq,cid);
     }
@@ -105,12 +146,14 @@ __global__ void read_kernel(Controller** ctrls,page_cache_d_t* pc,
 int main(int argc,char** argv) try {
     auto c=parse(argc,argv);
     cuda_err_chk(cudaSetDevice(c.gpu));
+    printf("Doorbell mode: %s\n", c.relay_doorbells ? "relay" : "mmio");
+    if(c.probe_only) return probe_mapping(c);
 #ifdef SWARMIO_COPILOT
     const char* engine="copilotio";
-    Controller ctrl("/dev/libnvm0",1,c.gpu,c.queue_depth,c.num_queues,QUEUE_CPU,QUEUE_CPU);
+    Controller ctrl("/dev/libnvm0",1,c.gpu,c.queue_depth,c.num_queues,QUEUE_CPU,QUEUE_CPU,c.relay_doorbells);
 #else
     const char* engine="bam";
-    Controller ctrl("/dev/libnvm0",1,c.gpu,c.queue_depth,c.num_queues);
+    Controller ctrl("/dev/libnvm0",1,c.gpu,c.queue_depth,c.num_queues,QUEUE_GPU,QUEUE_GPU,c.relay_doorbells);
 #endif
     if(ctrl.n_qps!=c.num_queues || c.page_size%ctrl.blk_size ||
        c.num_blks>ctrl.ns.size/(c.page_size/ctrl.blk_size)) throw std::runtime_error("namespace or queue limit mismatch");

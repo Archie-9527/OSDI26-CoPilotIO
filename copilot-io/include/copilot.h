@@ -126,15 +126,29 @@ private:
     gdr_mh_t mh;
     void* raw_gpu_ptr;
     void* map_ptr;
+    void* host_ptr;
     size_t alloc_size;
     size_t pin_size;
 
 public:
     CoPilotCQTable() : gpu_ptr(nullptr), cpu_ptr(nullptr),
-                       gdr(nullptr), raw_gpu_ptr(nullptr), map_ptr(nullptr),
+                       gdr(nullptr), raw_gpu_ptr(nullptr), map_ptr(nullptr), host_ptr(nullptr),
                        alloc_size(0), pin_size(0) {}
 
-    void init() {
+    void init(bool host_mapped = false) {
+        if (host_mapped) {
+            auto err = cudaHostAlloc(&host_ptr, sizeof(copilot_cq_table), cudaHostAllocMapped);
+            if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+            err = cudaHostGetDevicePointer((void**)&gpu_ptr, host_ptr, 0);
+            if (err != cudaSuccess) {
+                cudaFreeHost(host_ptr); host_ptr = nullptr;
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+            cpu_ptr = static_cast<copilot_cq_table*>(host_ptr);
+            memset(host_ptr, 0, sizeof(copilot_cq_table));
+            copilot_sfence();
+            return;
+        }
         size_t table_bytes = sizeof(copilot_cq_table);
         pin_size = (table_bytes + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK;
         alloc_size = pin_size + GPU_PAGE_SIZE;
@@ -178,6 +192,10 @@ public:
     }
 
     void destroy() {
+        if (host_ptr) {
+            cudaFreeHost(host_ptr);
+            host_ptr = nullptr;
+        }
         if (map_ptr) {
             gdr_unmap(gdr, mh, map_ptr, pin_size);
             map_ptr = nullptr;
@@ -256,9 +274,7 @@ static void* copilot_poll_thread(void* arg) {
             dst->pos = e.pos;
             dst->loc = e.loc;
             dst->cq_head = e.cq_head;
-            copilot_sfence();
-            dst->ready = 1;
-            copilot_sfence();
+            dst->status = dword3 >> 17;
 
             if (ci.cq_table_cpu_ptr) {
                 uint16_t sq_head = ci.cq[pos].dword[2] & 0xffff;
@@ -270,6 +286,12 @@ static void* copilot_poll_thread(void* arg) {
                 ci.cq_table_cpu_ptr->ready[pos] = 1;
                 copilot_sfence();
             }
+
+            // A visible notification guarantees that its CQ reclaim metadata
+            // has already been published, including in host notification mode.
+            copilot_sfence();
+            dst->ready = 1;
+            copilot_sfence();
 
             ci.head++;
             ci.completions++;

@@ -1,20 +1,23 @@
-// Identical finite workload for BaM and CoPilotIO; one NVMe command per operation.
+// Finite read workload: synchronous BaM baseline and batched CoPilotIO submission.
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <stdexcept>
 #include <memory>
+#include <algorithm>
 #include <sched.h>
 #include <ctrl.h>
 #include <page_cache.h>
 #ifdef SWARMIO_COPILOT
 #include <copilot.h>
+#include "swarmio_batch.cuh"
 #endif
 
 struct Config {
     uint64_t threads=64, blk_size=64, reqs=1, pages=4096, page_size=512;
     uint64_t num_blks=2097152, queue_depth=512, num_queues=1;
+    uint64_t batch_size=1;
     int gpu=0, base_core=0, cores=4;
     bool random=false;
     bool host_notify=false;
@@ -56,6 +59,7 @@ static Config parse(int argc,char** argv) {
         else if(k=="--num_blks") c.num_blks=v;
         else if(k=="--queue_depth") c.queue_depth=v;
         else if(k=="--num_queues") c.num_queues=v;
+        else if(k=="--batch_size") c.batch_size=v;
         else if(k=="--gpu" && v<=1024) c.gpu=v;
         else if(k=="--copilot_base_core" && v<CPU_SETSIZE) c.base_core=v;
         else if(k=="--copilot_cores" && v>0 && v<=64) c.cores=v;
@@ -69,6 +73,18 @@ static Config parse(int argc,char** argv) {
        c.num_blks>UINT64_MAX/c.page_size || !c.num_queues || c.num_queues>64 ||
        c.queue_depth<2 || c.queue_depth>1024 || (c.queue_depth&(c.queue_depth-1)))
         throw std::runtime_error("invalid workload geometry (pages must cover threads)");
+    if (!c.batch_size || c.batch_size>32)
+        throw std::runtime_error("batch_size must be in 1..32");
+    if (c.threads*c.reqs>UINT64_MAX/c.page_size)
+        throw std::runtime_error("workload byte count overflow");
+#ifndef SWARMIO_COPILOT
+    if (c.batch_size!=1) throw std::runtime_error("BaM baseline requires batch_size=1");
+#endif
+    uint64_t window=std::min(c.batch_size,c.reqs);
+    if (c.pages<c.threads*window)
+        throw std::runtime_error("pages must cover threads * min(batch_size, reqs)");
+    if (c.batch_size>1 && ((c.threads+c.num_queues-1)/c.num_queues)*window>=c.queue_depth)
+        throw std::runtime_error("batch exceeds per-queue capacity: ceil(threads/num_queues) * min(batch_size,reqs) must be < queue_depth");
     return c;
 }
 
@@ -98,6 +114,8 @@ static int probe_mapping(const Config& c) {
     printf("Probe stage: notification %s\n",c.host_notify ? "host" : "gdr"); fflush(stdout);
     CoPilotNotify notify;
     notify.init(c.host_notify);
+    CoPilotCQTable table;
+    table.init(c.host_notify);
 #endif
     cuda_err_chk(cudaDeviceSynchronize());
     printf("Probe OK: registration and DMA mappings only; no NVMe I/O issued\n");
@@ -105,42 +123,59 @@ static int probe_mapping(const Config& c) {
 }
 
 __global__ void read_kernel(Controller** ctrls,page_cache_d_t* pc,
-    uint64_t threads,uint64_t reqs,uint64_t range,uint64_t blocks,bool random
+    uint64_t threads,uint64_t reqs,uint64_t range,uint64_t blocks,bool random,uint32_t batch_size
 #ifdef SWARMIO_COPILOT
-    ,copilot_notify_entry** notifies
+    ,copilot_notify_entry** notifies,copilot_cq_table** tables
 #endif
 ) {
     uint64_t tid=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if(tid>=threads) return;
     auto qp=ctrls[0]->d_qps+(tid%ctrls[0]->n_qps);
     uint64_t seed=tid*6364136223846793005ULL+1442695040888963407ULL;
-    for(uint64_t i=0;i<reqs;i++) {
-        seed^=seed<<13; seed^=seed>>7; seed^=seed<<17;
-        uint64_t lba=(random ? seed%range : (tid+i)%range)*blocks;
-        nvm_cmd_t cmd;
-        uint16_t cid=get_cid(&qp->sq);
-        nvm_cmd_header(&cmd,cid,NVM_IO_READ,qp->nvmNamespace);
-        nvm_cmd_data_ptr(&cmd,pc->prp1[tid],pc->prps ? pc->prp2[tid] : 0);
-        nvm_cmd_rw_blks(&cmd,lba,blocks);
-        sq_enqueue(&qp->sq,&cmd);
-        uint32_t head,head_,pos;
-#ifdef SWARMIO_COPILOT
-        volatile copilot_notify_entry* notify=notifies[tid%ctrls[0]->n_qps];
-        while(!notify[cid].ready) __nanosleep(64);
-        // CPU publishes metadata before ready; volatile reads bypass GPU L1.
-        __threadfence_system();
-        pos=notify[cid].pos; head=notify[cid].loc; head_=notify[cid].cq_head;
-        __threadfence_system();
-        notify[cid].ready=0;
-        __threadfence_system();
-#else
-        pos=cq_poll(&qp->cq,cid,&head,&head_);
-#endif
-        if ((static_cast<volatile nvm_cpl_t*>(qp->cq.vaddr)[pos].dword[3] >> 17) != 0) {
-            printf("NVMe read error cid=%u\n",unsigned(cid)); asm("trap;");
+    uint32_t window=uint32_t(reqs<batch_size ? reqs : batch_size);
+    uint16_t cids[32];
+    for(uint64_t done=0;done<reqs;) {
+        uint32_t count=uint32_t(reqs-done<window ? reqs-done : window);
+        // First submit the whole batch, using a distinct buffer for every CID.
+        for(uint32_t b=0;b<count;++b) {
+            uint64_t i=done+b;
+            seed^=seed<<13; seed^=seed>>7; seed^=seed<<17;
+            uint64_t lba=(random ? seed%range : (tid+i)%range)*blocks;
+            nvm_cmd_t cmd;
+            uint16_t cid=get_cid(&qp->sq);
+            nvm_cmd_header(&cmd,cid,NVM_IO_READ,qp->nvmNamespace);
+            uint64_t page=tid*window+b;
+            nvm_cmd_data_ptr(&cmd,pc->prp1[page],pc->prps ? pc->prp2[page] : 0);
+            nvm_cmd_rw_blks(&cmd,lba,blocks);
+            sq_enqueue(&qp->sq,&cmd);
+            cids[b]=cid;
         }
-        cq_dequeue(&qp->cq,pos,&qp->sq,head,head_);
-        put_cid(&qp->sq,cid);
+        // Only after submission finishes do we wait for individual CIDs.
+        for(uint32_t b=0;b<count;++b) {
+            uint16_t cid=cids[b];
+#ifdef SWARMIO_COPILOT
+            volatile copilot_notify_entry* notify=notifies[tid%ctrls[0]->n_qps];
+            while(!notify[cid].ready) __nanosleep(64);
+            // CPU publishes metadata before ready; volatile reads bypass GPU L1.
+            __threadfence_system();
+            uint32_t status=notify[cid].status;
+            __threadfence_system();
+            notify[cid].ready=0;
+            __threadfence_system();
+            if (status) { printf("NVMe read error cid=%u status=%u\n",unsigned(cid),status); asm("trap;"); }
+            // Reclaim CQ order independently of the order in which CIDs are waited.
+            drain_batch_cq(qp,tables[tid%ctrls[0]->n_qps]);
+#else
+            uint32_t head,head_,pos;
+            pos=cq_poll(&qp->cq,cid,&head,&head_);
+            if ((static_cast<volatile nvm_cpl_t*>(qp->cq.vaddr)[pos].dword[3] >> 17) != 0) {
+                printf("NVMe read error cid=%u\n",unsigned(cid)); asm("trap;");
+            }
+            cq_dequeue(&qp->cq,pos,&qp->sq,head,head_);
+#endif
+            put_cid(&qp->sq,cid);
+        }
+        done+=count;
     }
 }
 int main(int argc,char** argv) try {
@@ -164,28 +199,39 @@ int main(int argc,char** argv) try {
     page_cache_t pc(c.page_size,c.pages,c.gpu,ctrl,64,ctrls);
 #ifdef SWARMIO_COPILOT
     std::vector<CoPilotNotify> notifies(c.num_queues);
+    std::vector<CoPilotCQTable> tables(c.num_queues);
     std::vector<copilot_notify_entry*> ptrs(c.num_queues);
-    for(unsigned q=0;q<c.num_queues;q++) { notifies[q].init(c.host_notify); ptrs[q]=notifies[q].gpu_ptr; }
+    std::vector<copilot_cq_table*> table_ptrs(c.num_queues);
+    for(unsigned q=0;q<c.num_queues;q++) {
+        notifies[q].init(c.host_notify); ptrs[q]=notifies[q].gpu_ptr;
+        tables[q].init(c.host_notify); table_ptrs[q]=tables[q].gpu_ptr;
+    }
     copilot_notify_entry** d_ptrs=nullptr;
     cuda_err_chk(cudaMalloc(&d_ptrs,ptrs.size()*sizeof(ptrs[0])));
     cuda_err_chk(cudaMemcpy(d_ptrs,ptrs.data(),ptrs.size()*sizeof(ptrs[0]),cudaMemcpyHostToDevice));
+    copilot_cq_table** d_tables=nullptr;
+    cuda_err_chk(cudaMalloc(&d_tables,table_ptrs.size()*sizeof(table_ptrs[0])));
+    cuda_err_chk(cudaMemcpy(d_tables,table_ptrs.data(),table_ptrs.size()*sizeof(table_ptrs[0]),cudaMemcpyHostToDevice));
     CoPilotAgent agent;
     printf("Notification memory: %s\n", c.host_notify ? "host" : "gdr");
-    agent.start(c.num_queues,ctrl.h_qps,notifies.data(),c.base_core,c.cores);
+    agent.start(c.num_queues,ctrl.h_qps,notifies.data(),c.base_core,c.cores,tables.data());
 #endif
+    printf("Submission mode: %s\nBatch size: %llu\nEffective batch size: %llu\n",
+           c.batch_size>1 ? "batch" : "sync",(unsigned long long)c.batch_size,
+           (unsigned long long)std::min(c.batch_size,c.reqs));
     cudaEvent_t begin,end;
     cuda_err_chk(cudaEventCreate(&begin)); cuda_err_chk(cudaEventCreate(&end));
     cuda_err_chk(cudaEventRecord(begin));
-    read_kernel<<<c.threads/64,64>>>(pc.pdt.d_ctrls,pc.d_pc_ptr,c.threads,c.reqs,c.num_blks,c.page_size/ctrl.blk_size,c.random
+    read_kernel<<<c.threads/64,64>>>(pc.pdt.d_ctrls,pc.d_pc_ptr,c.threads,c.reqs,c.num_blks,c.page_size/ctrl.blk_size,c.random,c.batch_size
 #ifdef SWARMIO_COPILOT
-        ,d_ptrs
+        ,d_ptrs,d_tables
 #endif
     );
     cuda_err_chk(cudaGetLastError());
     cuda_err_chk(cudaEventRecord(end)); cuda_err_chk(cudaEventSynchronize(end));
     float ms=0; cuda_err_chk(cudaEventElapsedTime(&ms,begin,end));
 #ifdef SWARMIO_COPILOT
-    agent.stop(); cuda_err_chk(cudaFree(d_ptrs));
+    agent.stop(); cuda_err_chk(cudaFree(d_ptrs)); cuda_err_chk(cudaFree(d_tables));
 #endif
     double ops=double(c.threads)*c.reqs;
     printf("Elapsed Time: %.6f Number of Ops: %llu Data Size (bytes): %llu\n",

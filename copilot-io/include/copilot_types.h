@@ -10,6 +10,7 @@ struct copilot_notify_entry {
     uint32_t pos;
     uint32_t loc;
     uint32_t cq_head;
+    uint32_t status; // NVMe status without phase; survives reuse of the CQ slot.
 };
 
 #define COPILOT_NUM_CIDS 65536

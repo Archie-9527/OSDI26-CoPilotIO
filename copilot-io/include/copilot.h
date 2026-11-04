@@ -10,33 +10,10 @@
 #include <sched.h>
 #include <gdrapi.h>
 #include "nvm_types.h"
+#include "copilot_types.h"
 
 static inline void copilot_sfence() { __asm__ volatile("sfence" ::: "memory"); }
 static inline void copilot_pause()  { __asm__ volatile("pause"  ::: "memory"); }
-
-struct copilot_notify_entry {
-    volatile uint32_t ready;
-    uint32_t pos;
-    uint32_t loc;
-    uint32_t cq_head;
-};
-
-#define COPILOT_NUM_CIDS 65536
-#define COPILOT_NOTIFY_BYTES (COPILOT_NUM_CIDS * sizeof(copilot_notify_entry))
-
-#define COPILOT_CQ_MAX_DEPTH 4096
-
-struct copilot_cq_table_entry {
-    uint16_t cid;
-    uint16_t sq_head;
-};
-
-struct copilot_cq_table {
-    volatile uint32_t ready[COPILOT_CQ_MAX_DEPTH];
-    copilot_cq_table_entry entries[COPILOT_CQ_MAX_DEPTH];
-    volatile uint32_t drain_lock;
-    volatile uint32_t gpu_head;
-};
 
 class CoPilotNotify {
 public:
@@ -46,6 +23,7 @@ public:
 private:
     gdr_t gdr;
     gdr_mh_t mh;
+    void* host_ptr;
     void* raw_gpu_ptr;
     void* map_ptr;
     size_t alloc_size;
@@ -53,10 +31,23 @@ private:
 
 public:
     CoPilotNotify() : gpu_ptr(nullptr), cpu_ptr(nullptr),
-                      gdr(nullptr), raw_gpu_ptr(nullptr), map_ptr(nullptr),
+                      gdr(nullptr), host_ptr(nullptr), raw_gpu_ptr(nullptr), map_ptr(nullptr),
                       alloc_size(0), pin_size(0) {}
 
-    void init() {
+    void init(bool host_mapped = false) {
+        if (host_mapped) {
+            cudaError_t err = cudaHostAlloc(&host_ptr, COPILOT_NOTIFY_BYTES, cudaHostAllocMapped);
+            if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+            err = cudaHostGetDevicePointer((void**)&gpu_ptr, host_ptr, 0);
+            if (err != cudaSuccess) {
+                cudaFreeHost(host_ptr); host_ptr = nullptr;
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+            cpu_ptr = static_cast<copilot_notify_entry*>(host_ptr);
+            memset(host_ptr, 0, COPILOT_NOTIFY_BYTES);
+            copilot_sfence();
+            return;
+        }
         pin_size = (COPILOT_NOTIFY_BYTES + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK;
         alloc_size = pin_size + GPU_PAGE_SIZE;
 
@@ -101,6 +92,10 @@ public:
     }
 
     void destroy() {
+        if (host_ptr) {
+            cudaFreeHost(host_ptr);
+            host_ptr = nullptr;
+        }
         if (map_ptr) {
             gdr_unmap(gdr, mh, map_ptr, pin_size);
             map_ptr = nullptr;

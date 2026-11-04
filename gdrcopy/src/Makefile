@@ -18,8 +18,8 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-LIB_MAJOR_VER ?= $(shell awk '/\#define GDR_API_MAJOR_VERSION/ { print $$3 }' ../include/gdrapi.h | tr -d '\n')
-LIB_MINOR_VER ?= $(shell awk '/\#define GDR_API_MINOR_VERSION/ { print $$3 }' ../include/gdrapi.h | tr -d '\n')
+LIB_MAJOR_VER ?= $(shell awk '/#define GDR_API_MAJOR_VERSION/ { print $$3 }' ../include/gdrapi.h | tr -d '\n')
+LIB_MINOR_VER ?= $(shell awk '/#define GDR_API_MINOR_VERSION/ { print $$3 }' ../include/gdrapi.h | tr -d '\n')
 
 GDRAPI_ARCH ?= $(shell ../config_arch)
 GDRAPI_INC := ../include
@@ -57,7 +57,7 @@ lib: $(LIB)
 $(LIBOBJS): CFLAGS+=-fPIC
 $(LIB): $(LIBOBJS)
 	$(CC) -shared -Wl,-soname,$(LIB_SONAME) -o $@ $^
-	PATH=/sbin:/usr/sbin:$$PATH; ldconfig -n $(PWD)
+	PATH=/sbin:/usr/sbin:$$PATH; ldconfig -n $(CURDIR)
 	ln -sf $(LIB_DYNAMIC) $(LIB_SONAME)
 	ln -sf $(LIB_SONAME) $(LIB_BASENAME)
 

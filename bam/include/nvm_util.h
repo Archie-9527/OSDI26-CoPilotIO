@@ -273,6 +273,8 @@ uint32_t nvm_dis_node_from_ctrl(const nvm_ctrl_t* ctrl);
 #endif
 #endif
 
+// PTX helpers are compiled only by nvcc, never by the host library compiler.
+#ifdef __CUDACC__
 __forceinline__ __device__ uint32_t lane_id()
 {
     uint32_t ret;
@@ -293,5 +295,7 @@ __forceinline__ __device__ uint32_t get_smid() {
      asm  ("mov.u32 %0, %smid;" : "=r"(ret) );
      return ret;
 }
+
+#endif /* __CUDACC__ */
 
 #endif /* __NVM_UTIL_H__ */

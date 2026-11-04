@@ -18,8 +18,8 @@
 // Forward declaration (full definition in io_scheduler.cuh).
 struct victim_buffer_t;
 
-// Forward declaration (full definition in copilot.h).
-struct copilot_notify_entry;
+// Device functions below access notification fields and need complete types.
+#include "copilot_types.h"
 
 #ifndef __device__
 #define __device__
